@@ -798,8 +798,10 @@ class MessageSplitterPlugin(Star):
 
             char = text[i]
             if char in self.quote_chars:
-                if stack and stack[-1] == char: stack.pop()
-                else: stack.append(char)
+                if stack and stack[-1] == char: 
+                    stack.pop()
+                elif not stack: 
+                    stack.append(char)
             elif not stack and char in self.pair_map: stack.append(char)
             elif stack and char == self.pair_map.get(stack[-1]): stack.pop()
             
