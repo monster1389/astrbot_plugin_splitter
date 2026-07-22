@@ -45,6 +45,12 @@
         "options": ["单独发", "跟文字一起"],
         "default": "单独发"
       },
+      "enable_reply_simple": {
+        "description": "保留引用回复",
+        "hint": "打开后，分段发送的第一条消息会自动引用（回复）触发消息，看起来更有对话感。关闭则不引用。",
+        "type": "bool",
+        "default": true
+      },
       "remove_texts_simple": {
         "description": "删除特定文本",
         "hint": "把不想看到的内容填在这里，机器人回复中出现这些文字时会自动删掉。每行填一个。比如填「注：」就会删掉所有的「注：」。",

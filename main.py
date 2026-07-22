@@ -3,6 +3,7 @@ import re
 import math
 import random
 import asyncio
+import inspect
 from collections import defaultdict, deque
 from typing import List, Dict, Any
 
@@ -11,13 +12,17 @@ from astrbot.api.star import Context, Star
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.message_components import Plain, BaseMessageComponent, Reply, Record
-from astrbot.core.star.session_llm_manager import SessionServiceManager
+
+try:
+    from astrbot.core.star.session_llm_manager import SessionServiceManager
+except ImportError:
+    SessionServiceManager = None
 
 
 class MessageSplitterPlugin(Star):
-    def __init__(self, context: Context, config: AstrBotConfig):
+    def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
-        self.config = config
+        self.config = config if config is not None else {}
 
         # --- 1. 配置兼容性与迁移逻辑 ---
         self._migrate_config()
@@ -126,7 +131,7 @@ class MessageSplitterPlugin(Star):
         self._simple_overrides["enable_smart_split"] = True
         self._simple_overrides["balanced_split_mode"] = True
         self._simple_overrides["split_scope"] = "llm_only"
-        self._simple_overrides["enable_reply"] = True
+        self._simple_overrides["enable_reply"] = self._get_simple_cfg("enable_reply_simple", True)
         self._simple_overrides["enable_smart_reply"] = False
         self._simple_overrides["at_strategy"] = "跟随下段"
         self._simple_overrides["face_strategy"] = "嵌入"
@@ -234,7 +239,7 @@ class MessageSplitterPlugin(Star):
 
         # 2. 结构迁移：将顶层的扁平配置移动到嵌套对象中
         mapping = {
-            "simple_settings": ["enable_split", "max_segments_simple", "send_speed", "protect_emoji", "image_handling", "remove_texts_simple"],
+            "simple_settings": ["enable_split", "max_segments_simple", "send_speed", "protect_emoji", "image_handling", "enable_reply_simple", "remove_texts_simple"],
             "advanced_settings": ["enable_group_split_adv", "split_scope_adv", "split_chars_adv", "no_split_around_adv", "max_segments_adv", "balanced_split_adv", "clean_before_items_adv", "clean_after_items_adv", "inject_kaomoji_prompt_adv", "replace_rules_adv", "reverse_replace_adv", "send_speed_adv", "image_strategy_adv", "conversation_blacklist_adv", "conversation_whitelist_adv"],
             "basic_settings": ["enable_group_split", "split_scope", "max_length_no_split", "max_length_to_disable", "conversation_blacklist", "conversation_whitelist"],
             "split_settings": ["split_mode", "split_chars", "split_regex", "no_split_around", "enable_smart_split", "balanced_split_mode", "max_segments", "min_segment_length", "balanced_split_ratio_min", "balanced_split_ratio_max", "trim_segment_edge_blank_lines"],
@@ -607,11 +612,27 @@ class MessageSplitterPlugin(Star):
     async def _process_tts_for_segment(self, event: AstrMessageEvent, segment: List[BaseMessageComponent]) -> List[BaseMessageComponent]:
         if not self._get_cfg("enable_tts_for_segments", True): return segment
         try:
-            all_cfg = self.context.get_config(event.unified_msg_origin)
+            get_config = getattr(self.context, "get_config", None)
+            if not callable(get_config): return segment
+            # 新版 get_config 可能需要 1 个参数（umo），旧版可能不需要
+            try:
+                cfg_sig = inspect.signature(get_config)
+                cfg_params = [p for p in cfg_sig.parameters.values() if p.default is inspect.Parameter.empty]
+                if len(cfg_params) >= 1:
+                    all_cfg = get_config(event.unified_msg_origin)
+                else:
+                    all_cfg = get_config()
+            except (ValueError, TypeError):
+                all_cfg = get_config(event.unified_msg_origin)
             tts_cfg = all_cfg.get("provider_tts_settings", {})
             if not tts_cfg.get("enable", False): return segment
-            tts_prov = self.context.get_using_tts_provider(event.unified_msg_origin)
-            if not tts_prov or not await SessionServiceManager.should_process_tts_request(event): return segment
+            get_tts = getattr(self.context, "get_using_tts_provider", None)
+            if not callable(get_tts): return segment
+            tts_prov = get_tts(event.unified_msg_origin)
+            if not tts_prov: return segment
+            if SessionServiceManager is not None:
+                should_tts = getattr(SessionServiceManager, "should_process_tts_request", None)
+                if callable(should_tts) and not await should_tts(event): return segment
             if random.random() > float(tts_cfg.get("trigger_probability", 1.0)): return segment
             dual = tts_cfg.get("dual_output", False)
             new_seg = []
@@ -738,10 +759,17 @@ class MessageSplitterPlugin(Star):
                         p_c = text[i-1] if i > 0 else ""; n_c = text[i+len(delim)] if i+len(delim) < n else ""
                         # 纯英文上下文保护：前后都是 ASCII 字母/数字/标点
                         if re.match(r"^[a-zA-Z0-9 \t.?!,;:\-']$", p_c) and re.match(r"^[a-zA-Z0-9 \t.?!,;:\-']$", n_c): should = False
-                        # 中英文（含数字）混排空格保护：分隔符仅为空白时，若前后字符为 CJK 表意文字或 Latin/数字，则不分割
+                        # 中英文（含数字）混排空格保护：分隔符仅为空白时，仅当前后字符为不同文字体系（一侧 CJK，一侧 Latin/数字）才不分割
                         if should and re.match(r"^[ \t]+$", delim):
-                            cjk_lat = r"[\u4e00-\u9fff\u3400-\u4dbf\uF900-\uFAFFa-zA-Z0-9]"
-                            if p_c and n_c and re.match(cjk_lat, p_c) and re.match(cjk_lat, n_c): should = False
+                            cjk_re = r"[\u4e00-\u9fff\u3400-\u4dbf\uF900-\uFAFF]"
+                            lat_re = r"[a-zA-Z0-9]"
+                            if p_c and n_c:
+                                p_is_cjk = bool(re.match(cjk_re, p_c))
+                                p_is_lat = bool(re.match(lat_re, p_c))
+                                n_is_cjk = bool(re.match(cjk_re, n_c))
+                                n_is_lat = bool(re.match(lat_re, n_c))
+                                # 仅在跨文字体系（CJK-Latin 或 Latin-CJK）混排时保护空格不分段
+                                if (p_is_cjk and n_is_lat) or (p_is_lat and n_is_cjk): should = False
                     # 不分段保护词：保护词出现在分隔符之后（即将成为下一段开头）时不切分
                     if should and no_split_around:
                         after_pos = i + len(delim)
